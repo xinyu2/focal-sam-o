@@ -6,7 +6,11 @@ python cifar_train_sam.py --gpu 0 --imb_type exp --imb_factor 0.01 --loss_type L
 # Fine-tune CLIP
 python cifar_train_sam_clip.py --gpu 0 --imb_factor 0.01 --loss_type LA --SAM_type Focal-SAM --rho 0.05 --dataset cifar10 --seed 0 --flat_gamma 1.5 --sharpness 0.7 --arch CLIP-ViT-B/16 --root_log "./log/CLIP/cifar10" --root_model "./log/CLIP/cifar10" --epochs 20 --adaptformer --lr 0.01 --wd 5e-4
 
-python cifar_train_sam_clip.py --gpu 0 --imb_factor 0.01 --loss_type LA --SAM_type Focal-SAM --rho 0.05 --dataset cifar100 --seed 0 --flat_gamma 5.5 --sharpness 0.8 --arch CLIP-ViT-B/16 --root_log "./log/CLIP/cifar100" --root_model "./log/CLIP/cifar100" --epochs 20 --adaptformer --lr 0.01 --wd 5e-4
+python cifar_train_sam_clip.py --gpu 0 \
+	--imb_factor 0.01 -loss_type LA --SAM_type Focal-SAM --rho 0.05 \
+	--dataset cifar100 --seed 0 --flat_gamma 5.5 --sharpness 0.8 --arch CLIP-ViT-B/16 \
+	--root_log "./log/CLIP/cifar100" --root_model "./log/CLIP/cifar100" \
+	--epochs 20 --adaptformer --lr 0.01 --wd 5e-4
 
 
 
