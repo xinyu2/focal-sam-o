@@ -788,7 +788,12 @@ def apply_gptq(model: nn.Module, cal_loader, cfg: QuantConfig, device: str, mode
                 print(f"  [{layer_idx+1}/{len(quant_layers)}] {name}: skipped "
                       "(layer was not called during calibration)")
             gptq.free()
-            continue
+            raise RuntimeError(
+                f"GPTQ could not observe selected QuantLinear layer '{name}' "
+                "during calibration. The model forward likely bypasses the "
+                "module, so continuing would leave the requested scope only "
+                "partially quantized."
+            )
 
         # Quantize this layer
         loss = gptq.quantize(cfg)
@@ -798,7 +803,8 @@ def apply_gptq(model: nn.Module, cal_loader, cfg: QuantConfig, device: str, mode
         gptq.free()
         _clear_gpu_cache_if_needed(layer_idx, interval=2)
 
-    print("[GPTQ] Weight quantization complete.")
+    print(f"[GPTQ] Weight quantization complete ({len(quant_layers)}/"
+          f"{len(quant_layers)} layers).")
 
 
 # =============================================================================
@@ -1802,11 +1808,17 @@ def main():
         extra_skip=tuple(extra_skip),
     )
     print(f"[Scope={args.scope}] {selector.describe()}")
-    if family == "clip" and args.quant_method == "gptq" and args.scope != "adapter_only":
-        print("[Note] Focal-SAM CLIP uses direct F.linear calls for several "
-              "backbone/head tensors. GPTQ will quantize only modules that are "
-              "actually called during calibration; use RTN for broad weight-only "
-              "quantization of those direct tensors.")
+    if family == "clip" and args.quant_method == "gptq":
+        direct_parameters = [
+            name for name, param in model.named_parameters()
+            if param.dim() == 2
+            and name.endswith(("in_proj_weight", "lora_A", "lora_B"))
+            and selector.should_quantize(name)
+        ]
+        if direct_parameters:
+            print(f"[Note] GPTQ cannot hook {len(direct_parameters)} selected "
+                  "direct-matmul parameters; use RTN to quantize them. "
+                  f"Examples: {direct_parameters[:4]}")
 
     # Measure TRUE FP32 per-class accuracy before any QuantLinear wrapping.
     pc_fp32 = evaluate_per_class(model, test_loader, num_classes, device)

@@ -24,8 +24,11 @@ class ViT_Tuner(nn.Module):
 
             blocks = vit_model.transformer.resblocks
 
-            get_attn_in_weight = lambda i: blocks[i].attn.in_proj_weight
-            get_attn_in_bias = lambda i: blocks[i].attn.in_proj_bias
+            # Peft_ViT.__init__ has promoted attn.in_proj_weight/bias into a
+            # real attn.in_proj nn.Linear submodule. Read params through it so
+            # the tuner is consistent with the new module layout.
+            get_attn_in_weight = lambda i: blocks[i].attn.in_proj.weight
+            get_attn_in_bias = lambda i: blocks[i].attn.in_proj.bias
             get_attn_out_weight = lambda i: blocks[i].attn.out_proj.weight
             get_attn_out_bias = lambda i: blocks[i].attn.out_proj.bias
             get_mlp_in_weight = lambda i: blocks[i].mlp[0].weight
@@ -272,6 +275,49 @@ class ViT_Tuner(nn.Module):
         self.masked_linear_list = masked_linear_list
 
 
+def _promote_clip_in_proj(blocks: nn.Sequential) -> None:
+    """In-place: expose each ResidualAttentionBlock's MultiheadAttention
+    in_proj_weight/in_proj_bias as a real nn.Linear submodule under
+    attn.in_proj, MOVING the existing Parameters into it.
+
+    Why: PyTorch's MultiheadAttention stores in_proj as raw Parameters, so
+    the underlying matmul is invisible to module-level tooling like
+    forward_pre_hook (used by GPTQ to collect Hessians) and
+    replace_linears (used by the quantization driver to swap
+    nn.Linear -> QuantLinear). Promoting it to a Linear submodule means
+    any `attn.in_proj(x)` call in the visual forward path goes through
+    that module, and quantization sees it like every other Linear.
+
+    The original in_proj_weight / in_proj_bias entries are removed from
+    the parent MultiheadAttention so the state_dict has a single
+    canonical key per tensor (image_encoder...attn.in_proj.weight). After
+    replace_linears later wraps attn.in_proj as a QuantLinear, only the
+    quantized buffer is saved, with no stale FP32 duplicate riding along.
+    The visual forward path no longer calls MultiheadAttention.forward,
+    so removing the raw params is safe here. The text encoder uses a
+    separate, unmodified MultiheadAttention instance.
+    """
+    for block in blocks:
+        attn = block.attn
+        if hasattr(attn, "in_proj") and isinstance(attn.in_proj, nn.Linear):
+            continue  # idempotent
+        in_features = attn.in_proj_weight.shape[1]
+        out_features = attn.in_proj_weight.shape[0]
+        weight_param = attn.in_proj_weight
+        bias_param = attn.in_proj_bias
+        # Detach the Parameters from MultiheadAttention's _parameters dict
+        # so they no longer appear under their legacy names in state_dict,
+        # then move them into the new Linear submodule.
+        del attn._parameters["in_proj_weight"]
+        if bias_param is not None:
+            del attn._parameters["in_proj_bias"]
+        in_proj = nn.Linear(in_features, out_features, bias=bias_param is not None)
+        in_proj.weight = weight_param
+        if bias_param is not None:
+            in_proj.bias = bias_param
+        attn.in_proj = in_proj
+
+
 class Peft_ViT(nn.Module):
     def __init__(self, vit_model):
         super().__init__()
@@ -283,6 +329,7 @@ class Peft_ViT(nn.Module):
             self.positional_embedding = vit_model.positional_embedding
             self.ln_pre = vit_model.ln_pre
             self.blocks = vit_model.transformer.resblocks
+            _promote_clip_in_proj(self.blocks)
             self.ln_post = vit_model.ln_post
             self.proj = vit_model.proj  # not used
             self.out_dim = self.ln_post.bias.shape[0]
@@ -347,34 +394,48 @@ class Peft_ViT(nn.Module):
                 _mlp = block.mlp
                 _ln_2 = block.ln_2
 
-                _attn_in_proj_weight = _attn.in_proj_weight
-                _attn_in_proj_bias = _attn.in_proj_bias
-                _attn_out_proj_weight = _attn.out_proj.weight
-                _attn_out_proj_bias = _attn.out_proj.bias
-                _mlp_in_proj_weight = _mlp[0].weight
-                _mlp_in_proj_bias = _mlp[0].bias
+                # Module references for the four matmuls. Going through these
+                # (instead of F.linear on captured weight/bias) is what lets
+                # replace_linears swap them for QuantLinear and lets GPTQ's
+                # forward_pre_hook see the inputs.
+                _attn_in_proj = _attn.in_proj
+                _attn_out_proj = _attn.out_proj
+                _mlp_in_proj = _mlp[0]
+                _mlp_out_proj = _mlp[2]
+                # Raw weight/bias still needed for the masked_linear branch,
+                # which scatters its optimized params into them at forward time.
+                _attn_in_proj_weight = _attn_in_proj.weight
+                _attn_in_proj_bias = _attn_in_proj.bias
+                _attn_out_proj_weight = _attn_out_proj.weight
+                _attn_out_proj_bias = _attn_out_proj.bias
+                _mlp_in_proj_weight = _mlp_in_proj.weight
+                _mlp_in_proj_bias = _mlp_in_proj.bias
                 _mlp_act = _mlp[1]
-                _mlp_out_proj_weight = _mlp[2].weight
-                _mlp_out_proj_bias = _mlp[2].bias
+                _mlp_out_proj_weight = _mlp_out_proj.weight
+                _mlp_out_proj_bias = _mlp_out_proj.bias
 
                 _num_heads = _attn.num_heads
                 _head_dim = _emb_dim // _num_heads
-            
+
             elif self.backbone == "ViT":
                 _attn = block.attn
                 _ln_1 = block.norm1
                 _mlp = block.mlp
                 _ln_2 = block.norm2
 
-                _attn_in_proj_weight = _attn.qkv.weight
-                _attn_in_proj_bias = _attn.qkv.bias
-                _attn_out_proj_weight = _attn.proj.weight
-                _attn_out_proj_bias = _attn.proj.bias
-                _mlp_in_proj_weight = _mlp.fc1.weight
-                _mlp_in_proj_bias = _mlp.fc1.bias
+                _attn_in_proj = _attn.qkv
+                _attn_out_proj = _attn.proj
+                _mlp_in_proj = _mlp.fc1
+                _mlp_out_proj = _mlp.fc2
+                _attn_in_proj_weight = _attn_in_proj.weight
+                _attn_in_proj_bias = _attn_in_proj.bias
+                _attn_out_proj_weight = _attn_out_proj.weight
+                _attn_out_proj_bias = _attn_out_proj.bias
+                _mlp_in_proj_weight = _mlp_in_proj.weight
+                _mlp_in_proj_bias = _mlp_in_proj.bias
                 _mlp_act = _mlp.act
-                _mlp_out_proj_weight = _mlp.fc2.weight
-                _mlp_out_proj_bias = _mlp.fc2.bias
+                _mlp_out_proj_weight = _mlp_out_proj.weight
+                _mlp_out_proj_bias = _mlp_out_proj.bias
 
                 _num_heads = _attn.num_heads
                 _head_dim = _emb_dim // _num_heads
@@ -391,7 +452,7 @@ class Peft_ViT(nn.Module):
             if masked_linear is not None:
                 qkv = masked_linear["attn_in"](x, _attn_in_proj_weight, _attn_in_proj_bias)
             else:
-                qkv = F.linear(x, _attn_in_proj_weight, _attn_in_proj_bias)
+                qkv = _attn_in_proj(x)
             q, k, v = qkv.chunk(3, dim=-1)
 
             if lora is not None:
@@ -419,7 +480,7 @@ class Peft_ViT(nn.Module):
             if masked_linear is not None:
                 x = masked_linear["attn_out"](x, _attn_out_proj_weight, _attn_out_proj_bias)
             else:
-                x = F.linear(x, _attn_out_proj_weight, _attn_out_proj_bias)
+                x = _attn_out_proj(x)
             if ssf_attn is not None:
                 x = ssf_attn["attn_out"](x)
 
@@ -439,7 +500,7 @@ class Peft_ViT(nn.Module):
             if masked_linear is not None:
                 x_out = masked_linear["mlp_in"](x, _mlp_in_proj_weight, _mlp_in_proj_bias)
             else:
-                x_out = F.linear(x, _mlp_in_proj_weight, _mlp_in_proj_bias)
+                x_out = _mlp_in_proj(x)
             
             if lora_mlp is not None:
                 x_out = x_out + lora_mlp["1"](x)
@@ -454,7 +515,7 @@ class Peft_ViT(nn.Module):
             if masked_linear is not None:
                 x_out = masked_linear["mlp_out"](x, _mlp_out_proj_weight, _mlp_out_proj_bias)
             else:
-                x_out = F.linear(x, _mlp_out_proj_weight, _mlp_out_proj_bias)
+                x_out = _mlp_out_proj(x)
             
             if lora_mlp is not None:
                 x_out = x_out + lora_mlp["2"](x)

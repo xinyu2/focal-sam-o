@@ -34,20 +34,46 @@ class LinearClassifier(_Classifier):
         return F.linear(x, self.weight, self.bias)
 
 
-class CosineClassifier(_Classifier):
+class CosineClassifier(nn.Module):
+    """Cosine classifier with the matmul exposed as a real nn.Linear submodule.
+
+    Why the structure: the previous implementation stored the classifier
+    weight as a raw nn.Parameter and called F.linear in forward. That made
+    the head invisible to module-level tooling (replace_linears, GPTQ's
+    forward_pre_hook), so post-training quantization silently skipped it.
+    By holding the matmul on `self.linear`, the head participates in the
+    same QuantLinear swap path as the backbone, and `--scope full`
+    actually quantizes it.
+
+    Note: the legacy forward applied F.normalize to the weight on every
+    call. After init_clip_head_from_text writes already-L2-normalized text
+    features into head.linear.weight that step is a near-identity on the
+    FP32 path, so dropping it preserves training-time behavior. After
+    quantization, weight rows are no longer exactly unit-norm — the same
+    trade-off SAP-v2's `CosineClassifier(nn.Linear)` makes.
+    """
+
     def __init__(self, feat_dim=None, num_classes=None, dtype=None, scale=25, **kwargs):
-        super().__init__(feat_dim, num_classes, dtype)
+        super().__init__()
+        self.linear = nn.Linear(feat_dim, num_classes, bias=False, dtype=dtype)
+        self.linear.weight.data.uniform_(-1, 1).renorm_(2, 0, 1.0).mul_(1.0)
         self.scale = scale
+
+    @property
+    def weight(self):
+        # Backwards compatibility for code that reads head.weight.
+        return self.linear.weight
+
+    @property
+    def dtype(self):
+        return self.linear.weight.dtype
+
+    def apply_weight(self, weight):
+        self.linear.weight.data = weight.clone()
 
     def forward(self, x):
         x = F.normalize(x, dim=-1)
-        # print("normed x", x)
-        # print("weight", self.weight)
-        weight = F.normalize(self.weight, dim=-1)
-        # print("normed weight", weight)
-        # print("linear", F.linear(x, weight))
-        # exit(0)
-        return F.linear(x, weight) * self.scale
+        return self.linear(x) * self.scale
 
 
 class L2NormedClassifier(_Classifier):
