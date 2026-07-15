@@ -29,11 +29,14 @@ Notes:
   - Native Focal-SAM checkpoints are loaded from their `state_dict` field.
   - `--args_file` reuses the training-time Namespace, which is the safest way
     to rebuild CLIP PEFT checkpoints with the same AdaptFormer/LoRA options.
+  - The CLIP cosine classifier keeps its training checkpoint at `head.weight`.
+    PTQ wraps that parameter locally, quantizes the effective L2-normalized
+    rows, and normalizes the quantized rows again on every forward pass.
   - RTN also covers direct F.linear parameters used by Focal-SAM CLIP that
     are not nn.Linear submodules (e.g. LoRA factors, text-encoder
     in_proj_weight when --quantize_text_encoder is set). Backbone attn
-    in_proj and the classifier head are real nn.Linear modules now and
-    flow through QuantLinear under both RTN and GPTQ.
+    in_proj and the PTQ-wrapped classifier flow through QuantLinear under
+    both RTN and GPTQ.
 """
 
 import argparse
@@ -335,8 +338,11 @@ class LinearSelectionRule:
 class LinearSelector:
     default_quantize: bool
     rules: Tuple[LinearSelectionRule, ...] = ()
+    exact_paths: Optional[Tuple[str, ...]] = None
 
     def should_quantize(self, module_path: str) -> bool:
+        if self.exact_paths is not None:
+            return module_path in self.exact_paths
         selected = self.default_quantize
         for rule in self.rules:
             if rule.pattern in module_path:
@@ -344,6 +350,8 @@ class LinearSelector:
         return selected
 
     def describe(self) -> str:
+        if self.exact_paths is not None:
+            return f"exact_paths={list(self.exact_paths)}"
         default = "quantize" if self.default_quantize else "keep_fp32"
         if not self.rules:
             return f"default={default}; rules=[]"
@@ -414,15 +422,22 @@ class QuantLinear(nn.Module):
     falls back to per-batch max (RTN-style).
     """
 
-    def __init__(self, linear: nn.Linear, cfg: QuantConfig):
+    def __init__(
+        self,
+        linear: nn.Module,
+        cfg: QuantConfig,
+        normalize_weight: bool = False,
+    ):
         super().__init__()
         self.cfg = cfg
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
+        self.in_features = getattr(linear, "in_features", linear.weight.shape[1])
+        self.out_features = getattr(linear, "out_features", linear.weight.shape[0])
+        self.normalize_weight = normalize_weight
         # Keep .weight and .bias as plain tensors so downstream hooks work.
         self.register_buffer("weight", linear.weight.data.clone())
-        if linear.bias is not None:
-            self.register_buffer("bias", linear.bias.data.clone())
+        bias = getattr(linear, "bias", None)
+        if bias is not None:
+            self.register_buffer("bias", bias.data.clone())
         else:
             self.bias = None
         # Calibration-set activation scale (scalar). Set by calibrate() or left None.
@@ -460,6 +475,8 @@ class QuantLinear(nn.Module):
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         scheme = getattr(self.cfg, "act_scheme", "per_tensor")
         weight = self.weight.to(dtype=x.dtype)
+        if self.normalize_weight:
+            weight = F.normalize(weight, dim=-1)
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
         # If SmoothQuant was applied, this layer has buffer `smooth_inv_scale` of
@@ -497,6 +514,46 @@ class QuantLinear(nn.Module):
         return F.linear(xq, weight, bias)
 
 
+class QuantizedCosineClassifier(nn.Module):
+    """PTQ wrapper that preserves ``CosineClassifier`` forward semantics.
+
+    Training stores an unconstrained ``head.weight`` parameter but uses its
+    row-normalized value in every forward. The raw row norms therefore carry
+    no classifier information. Canonicalize those rows before quantization,
+    then normalize the fake-quantized rows in ``QuantLinear`` on every call.
+    """
+
+    def __init__(self, classifier: nn.Module, cfg: QuantConfig):
+        super().__init__()
+        self.scale = classifier.scale
+        self.linear = QuantLinear(classifier, cfg, normalize_weight=True)
+        self.linear.weight.data = F.normalize(
+            self.linear.weight.data, dim=-1
+        )
+
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @property
+    def dtype(self):
+        return self.linear.weight.dtype
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.normalize(x, dim=-1)
+        return self.linear(x) * self.scale
+
+
+def _is_direct_cosine_classifier(module: nn.Module) -> bool:
+    """Identify the normalized Focal-SAM classifier without coupling imports."""
+    return (
+        module.__class__.__name__ == "CosineClassifier"
+        and isinstance(getattr(module, "weight", None), nn.Parameter)
+        and hasattr(module, "scale")
+        and not hasattr(module, "linear")
+    )
+
+
 def replace_linears(
     module: nn.Module,
     cfg: QuantConfig,
@@ -524,6 +581,9 @@ def replace_linears(
             if not selector.should_quantize(full):
                 continue
             setattr(module, name, QuantLinear(child, cfg))
+        elif _is_direct_cosine_classifier(child):
+            if selector.should_quantize(full):
+                setattr(module, name, QuantizedCosineClassifier(child, cfg))
         else:
             replace_linears(
                 child, cfg, selector=selector, _prefix=full,
@@ -1238,14 +1298,14 @@ def _checkpoint_layout_pair(key: str) -> Optional[Tuple[str, str]]:
 
 
 def _remap_legacy_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Remap legacy state_dict keys to the promoted submodule layout.
+    """Remap direct-parameter keys to the PTQ-promoted submodule layout.
 
     Two refactors broke key compatibility with older checkpoints:
       1. attn.in_proj was promoted to a real nn.Linear under each visual
          ResidualAttentionBlock (models_clip/peft_vit.py:_promote_clip_in_proj).
          image_encoder.blocks.<i>.attn.in_proj_weight -> ...attn.in_proj.weight
-      2. CosineClassifier now holds an inner nn.Linear (head.linear) so the
-         head is wrapped by replace_linears as QuantLinear.
+      2. PTQ temporarily wraps the direct normalized CosineClassifier weight
+         in a QuantLinear so both RTN and GPTQ can observe it.
          head.weight -> head.linear.weight
 
     Text-encoder MultiheadAttention is unmodified, so its in_proj_weight /
@@ -1264,11 +1324,10 @@ def _align_checkpoint_keys(
 ) -> Dict[str, torch.Tensor]:
     """Translate known layout aliases to the schema expected by a model.
 
-    Focal-SAM-o keeps MultiheadAttention's raw ``in_proj_*`` parameters and a
-    direct classifier ``weight``. The newer Focal-SAM promotes those tensors to
-    real Linear submodules for quantization. Resolve aliases in either direction
-    from the target model rather than assuming which repository is importing
-    this loader.
+    The training model keeps a direct normalized classifier ``weight`` while
+    PTQ may promote it to a QuantLinear submodule. Historical checkpoints also
+    exist with the promoted layout. Resolve aliases in either direction from
+    the target model instead of assigning either layout different semantics.
     """
     target_keys = set(target_keys)
     source_keys = set(state_dict)
@@ -1297,10 +1356,20 @@ _remap_legacy_in_proj_keys = _remap_legacy_keys
 
 def load_focal_sam_checkpoint(model: nn.Module, path: str, device: str, strict: bool = True):
     raw = torch.load(path, map_location=device, weights_only=False)
+    target_keys = set(model.state_dict().keys())
     state_dict = _align_checkpoint_keys(
         _strip_module_prefix(_extract_state_dict(raw)),
-        model.state_dict().keys(),
+        target_keys,
     )
+    classifier_keys = target_keys.intersection(
+        {"head.weight", "head.linear.weight"}
+    )
+    missing_classifier = classifier_keys.difference(state_dict)
+    if missing_classifier:
+        raise RuntimeError(
+            f"Checkpoint '{path}' does not contain the classifier weight "
+            f"required by this model: {sorted(missing_classifier)}"
+        )
     result = model.load_state_dict(state_dict, strict=strict)
     if not strict:
         missing, unexpected = result
@@ -1317,25 +1386,44 @@ def load_focal_sam_checkpoint(model: nn.Module, path: str, device: str, strict: 
 
 @torch.no_grad()
 def evaluate_per_class(model, loader, num_classes: int, device: str, model_args=None):
+    """Return class recall/top-1 accuracy as percentages.
+
+    Classifier preprocessing belongs to ``model.forward``. In particular, the
+    normalized cosine classifier normalizes both features and its effective
+    weight rows there; evaluation must not mutate or independently normalize
+    the checkpoint parameter.
+    """
     if model_args is None:
         model_args = {}
     model.eval()
-    correct = np.zeros(num_classes, dtype=np.float64)
-    total = np.zeros(num_classes, dtype=np.float64)
+    correct = torch.zeros(num_classes, dtype=torch.int64, device=device)
+    total = torch.zeros(num_classes, dtype=torch.int64, device=device)
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         logits = model(x, **model_args)
+        if logits.ndim != 2 or logits.shape[1] != num_classes:
+            raise ValueError(
+                "Expected model logits with shape [batch, num_classes], got "
+                f"{tuple(logits.shape)} for num_classes={num_classes}."
+            )
+        if y.ndim != 1 or y.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"Expected labels with shape [{logits.shape[0]}], got {tuple(y.shape)}."
+            )
+        if y.numel() and ((y < 0).any() or (y >= num_classes).any()):
+            raise ValueError(f"Labels must be in [0, {num_classes - 1}].")
         pred = logits.argmax(dim=-1)
-        pred_np = pred.detach().cpu().numpy()
-        y_np = y.detach().cpu().numpy()
-        for c in range(num_classes):
-            mask = y_np == c
-            if mask.any():
-                total[c] += mask.sum()
-                correct[c] += (pred_np[mask] == c).sum()
+        total += torch.bincount(y, minlength=num_classes)
+        correct += torch.bincount(y[pred == y], minlength=num_classes)
+
+    correct_np = correct.cpu().numpy().astype(np.float64)
+    total_np = total.cpu().numpy().astype(np.float64)
     return np.divide(
-        correct, np.maximum(total, 1.0), out=np.zeros_like(correct), where=total > 0
+        correct_np,
+        total_np,
+        out=np.zeros_like(correct_np),
+        where=total_np > 0,
     ) * 100.0
 
 
@@ -1361,11 +1449,11 @@ def apply_direct_parameter_rtn(
 ):
     """RTN-quantize Focal-SAM parameters used through direct F.linear/matmul.
 
-    Coverage after the structural refactors:
+    Coverage after PTQ model surgery:
       - image_encoder attn.in_proj is now a real nn.Linear (covered by
         apply_rtn via QuantLinear)
-      - head is now CosineClassifier-with-inner-Linear (covered by
-        apply_rtn via QuantLinear)
+      - a selected direct normalized cosine head is wrapped by QuantLinear
+        (covered by apply_rtn)
     The remaining direct-parameter weights are LoRA factors (raw
     Parameters living on PEFT modules) and the text encoder's
     still-raw MultiheadAttention in_proj_weight (relevant only when
@@ -1411,6 +1499,37 @@ def _register_missing_buffers(model: nn.Module, state_dict: dict):
             parent.register_buffer(attr_name, torch.zeros_like(state_dict[key]))
 
 
+def _selector_from_quantized_state_dict(state_dict: Dict[str, torch.Tensor]):
+    """Reconstruct exactly which modules were saved as QuantLinear.
+
+    Older quantized checkpoints did not record ``--scope``. Every QuantLinear
+    has an ``act_scale`` buffer, so its state_dict still provides an exact and
+    unambiguous record of the model surgery that produced it.
+    """
+    paths = []
+    suffix = ".act_scale"
+    for key in state_dict:
+        if not key.endswith(suffix):
+            continue
+        path = key[:-len(suffix)]
+        # The source cosine head is selected at path "head" and PTQ stores its
+        # QuantLinear internally at "head.linear".
+        if path == "head.linear":
+            path = "head"
+        paths.append(path)
+    return LinearSelector(
+        default_quantize=False,
+        exact_paths=tuple(sorted(set(paths))),
+    )
+
+
+def _restore_quantlinear_runtime_state(model: nn.Module):
+    """Restore non-persistent flags derived from checkpointed buffers."""
+    for module in model.modules():
+        if isinstance(module, QuantLinear):
+            module._act_scale_set = bool(module.act_scale.detach().item() > 0)
+
+
 @torch.no_grad()
 def run_test_only(args, device):
     """Load baseline + two quantized checkpoints, evaluate per-class accuracy,
@@ -1449,7 +1568,7 @@ def run_test_only(args, device):
         print(f"Evaluating QUANTIZED [{i+1}]: {qckpt}")
         print(f"{'='*60}")
 
-        raw = torch.load(qckpt, map_location=device)
+        raw = torch.load(qckpt, map_location=device, weights_only=False)
         if not (isinstance(raw, dict) and "model" in raw and "qcfg" in raw):
             raise ValueError(
                 f"'{qckpt}' is not a quantized checkpoint (expected keys: 'model', 'qcfg')"
@@ -1465,24 +1584,15 @@ def run_test_only(args, device):
 
         model_q = build_focal_sam_model(args, family, bundle, device)
 
-        extra_skip = (
-            ("text_encoder",)
-            if family == "clip" and not args.quantize_text_encoder
-            else ()
-        )
-        selector = build_linear_selector(
-            "bbap",
-            adapter_key=args.adapter_key,
-            classifier_key=args.classifier_key,
-            extra_skip=extra_skip,
-        )
+        source_state = _strip_module_prefix(raw["model"])
+        selector = _selector_from_quantized_state_dict(source_state)
+        print(f"[Checkpoint scope] {selector.describe()}")
         replace_linears(model_q, qcfg, selector=selector)
 
-        q_state = _align_checkpoint_keys(
-            _strip_module_prefix(raw["model"]), model_q.state_dict().keys()
-        )
+        q_state = _align_checkpoint_keys(source_state, model_q.state_dict().keys())
         _register_missing_buffers(model_q, q_state)
-        model_q.load_state_dict(q_state, strict=False)
+        model_q.load_state_dict(q_state, strict=True)
+        _restore_quantlinear_runtime_state(model_q)
         model_q.eval()
 
         pc_acc = evaluate_per_class(model_q, bundle.test_loader, num_classes, device)
@@ -1687,7 +1797,8 @@ def build_args(argv: List[str]) -> argparse.Namespace:
 
 
 def main():
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
     _apply_args_file(args)
     family = _infer_model_family(args)
@@ -1759,6 +1870,14 @@ def main():
 
     _finalize_scope_keys(args, family)
 
+    # Build and load the model being quantized before optional comparison
+    # models. This guarantees every reported FP32/quantized delta starts from
+    # the requested model_dir checkpoint (including its normalized head.weight).
+    model = build_focal_sam_model(args, family, bundle, device)
+    load_focal_sam_checkpoint(
+        model, args.model_dir, device, strict=args.strict_load
+    )
+
     # ── Optional: evaluate the FP32 baseline checkpoint ──────────────────
     pc_baseline = None
     if args.baseline_ckpt is not None:
@@ -1766,20 +1885,12 @@ def main():
         model_baseline = build_focal_sam_model(args, family, bundle, device)
         load_focal_sam_checkpoint(model_baseline, args.baseline_ckpt, device,
                                   strict=args.strict_load)
-        raw = load_focal_sam_checkpoint(model, args.model_dir, device, strict=False)
-        print("best_acc1 in ckpt:", raw.get("best_acc1"))
-        print("head.linear.weight sum:", model.head.linear.weight.float().sum().item())
-        # compare against the text-feature init by re-initing a fresh copy and diffing
         pc_baseline = evaluate_per_class(model_baseline, test_loader, num_classes, device)
         acc_baseline = pc_baseline.mean() / 100.0
         print(f"[Baseline FP32] acc = {acc_baseline:.4f}")
         del model_baseline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    model = build_focal_sam_model(args, family, bundle, device)
-
-    load_focal_sam_checkpoint(model, args.model_dir, device, strict=args.strict_load)
 
     # ── Quantization ─────────────────────────────────────────────────────    
     # FP8 has enough dynamic range that per-channel scales are sufficient;
@@ -1920,7 +2031,16 @@ def main():
 
     # ── Save ─────────────────────────────────────────────────────────────
     out_path = os.path.join(run_output_dir, f"model_{args.quant_method}_{args.format}.pth")
-    torch.save({"model": model.state_dict(), "qcfg": qcfg.__dict__, "acc": acc_q}, out_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "qcfg": qcfg.__dict__,
+            "quant_method": args.quant_method,
+            "scope": args.scope,
+            "acc": acc_q,
+        },
+        out_path,
+    )
     print(f"\nSaved to {out_path}")
 
     results = {
