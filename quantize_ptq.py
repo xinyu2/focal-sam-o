@@ -41,10 +41,12 @@ Notes:
 
 import argparse
 import ast
+import hashlib
 import json
 import math
 import os
 import random
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -57,6 +59,86 @@ import torchvision.transforms as transforms
 
 import models
 from datasets.imbalance_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
+
+
+# =============================================================================
+# Reproducible runtime configuration
+# =============================================================================
+
+def configure_reproducibility(seed: Optional[int], deterministic: bool = True) \
+        -> Dict[str, Any]:
+    """Configure every RNG and CUDA backend used by PTQ.
+
+    This mirrors SAP-v2's canonical PTQ policy so deployment and diagnostic
+    runs build identical FP32 Hessians.
+    """
+    deterministic = bool(deterministic)
+    if deterministic:
+        # This must be set before the first cuBLAS workspace is created.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    if seed is not None:
+        seed = int(seed)
+        print(f"Setting fixed seed: {seed}")
+        random.seed(seed)
+        np.random.seed(seed)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        print("Setting deterministic FP32 operations.")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+    else:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+
+    return reproducibility_provenance()
+
+
+def reproducibility_provenance(model: Optional[nn.Module] = None) \
+        -> Dict[str, Any]:
+    """Return the numerical runtime state that can affect PTQ hashes."""
+    record: Dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "cudnn_enabled": torch.backends.cudnn.enabled,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
+    if torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        record.update({
+            "cuda_device_index": device_index,
+            "cuda_device_name": torch.cuda.get_device_name(device_index),
+            "cuda_device_capability": list(
+                torch.cuda.get_device_capability(device_index)
+            ),
+        })
+    if model is not None:
+        record["model_floating_dtypes"] = sorted({
+            str(tensor.dtype)
+            for tensor in model.state_dict().values()
+            if torch.is_tensor(tensor) and tensor.is_floating_point()
+        })
+    return record
 
 
 # =============================================================================
@@ -1001,6 +1083,350 @@ def smoothquant_migrate(
 
 
 # =============================================================================
+# Reproducibility provenance
+# =============================================================================
+
+QUANT_PROVENANCE_SCHEMA = "quantization_provenance_v1"
+TENSOR_HASH_SPEC = "sha256(dtype-shape-little-endian-bytes)-v1"
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def _json_safe(value: Any):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _sha256_file(path: str, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_record(path: str) -> Dict[str, Any]:
+    resolved = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"Provenance file does not exist: {resolved}")
+    return {
+        "path": resolved,
+        "size_bytes": os.path.getsize(resolved),
+        "sha256": _sha256_file(resolved),
+    }
+
+
+def _tensor_hash_record(tensor: torch.Tensor) -> Dict[str, Any]:
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"Expected tensor for provenance hash, got {type(tensor)}")
+    if sys.byteorder != "little":
+        raise RuntimeError("Tensor provenance v1 requires a little-endian host")
+    cpu = tensor.detach().cpu().contiguous()
+    header = {
+        "dtype": str(cpu.dtype),
+        "shape": list(cpu.shape),
+        "byteorder": sys.byteorder,
+    }
+    digest = hashlib.sha256()
+    digest.update(_canonical_json_bytes(header))
+    digest.update(b"\0")
+    if cpu.numel():
+        # Flatten first so scalar tensors also support the dtype reinterpretation.
+        digest.update(cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return {
+        **header,
+        "numel": int(cpu.numel()),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _records_sha256(records: Iterable[Dict[str, Any]]) -> str:
+    return _sha256_json(list(records))
+
+
+def _unwrap_subset_indices(dataset) -> Tuple[Any, List[int]]:
+    """Return the base dataset and ordered base-dataset indices."""
+    ordered = list(range(len(dataset)))
+    base = dataset
+    while isinstance(base, torch.utils.data.Subset):
+        ordered = [int(base.indices[i]) for i in ordered]
+        base = base.dataset
+    return base, ordered
+
+
+def _as_int(value: Any) -> int:
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError(f"Expected scalar target, got shape={tuple(value.shape)}")
+        return int(value.item())
+    if isinstance(value, np.generic):
+        return int(value.item())
+    return int(value)
+
+
+def _split_dataset_item(item) -> Tuple[torch.Tensor, Optional[int]]:
+    if isinstance(item, (tuple, list)):
+        if not item:
+            raise ValueError("Calibration dataset returned an empty sequence")
+        image = item[0]
+        target = _as_int(item[1]) if len(item) > 1 else None
+    elif isinstance(item, dict):
+        image = item.get("image", item.get("images", item.get("input")))
+        target_value = item.get("target", item.get("label"))
+        target = _as_int(target_value) if target_value is not None else None
+    else:
+        image, target = item, None
+    if not torch.is_tensor(image):
+        raise TypeError(
+            "Calibration provenance requires transformed tensors; "
+            f"dataset returned {type(image)}"
+        )
+    return image, target
+
+
+def _ordered_dataset_targets(base_dataset, ordered_indices: List[int], dataset) \
+        -> List[int]:
+    values = None
+    for attr in ("targets", "labels"):
+        candidate = getattr(base_dataset, attr, None)
+        if candidate is not None:
+            values = candidate
+            break
+    if values is not None:
+        return [_as_int(values[index]) for index in ordered_indices]
+
+    targets = []
+    for position in range(len(dataset)):
+        _, target = _split_dataset_item(dataset[position])
+        if target is None:
+            raise ValueError("Calibration dataset does not expose targets")
+        targets.append(target)
+    return targets
+
+
+def _calibration_probe_positions(count: int, batch_size: int) -> List[int]:
+    if count <= 0:
+        return []
+    candidates = (
+        0, 1, batch_size - 1, batch_size,
+        count // 2 - 1, count // 2, count - 2, count - 1,
+    )
+    return sorted({position for position in candidates if 0 <= position < count})
+
+
+def calibration_provenance(cal_loader, requested_n_cal: Optional[int]) \
+        -> Dict[str, Any]:
+    sampler = getattr(cal_loader, "sampler", None)
+    if not isinstance(sampler, torch.utils.data.SequentialSampler):
+        raise RuntimeError(
+            "Calibration provenance requires a SequentialSampler so the "
+            f"recorded order is exact; got {type(sampler).__name__}"
+        )
+    if getattr(cal_loader, "drop_last", False):
+        raise RuntimeError(
+            "Calibration provenance requires drop_last=False so every "
+            "recorded index is consumed"
+        )
+
+    dataset = cal_loader.dataset
+    base_dataset, ordered_indices = _unwrap_subset_indices(dataset)
+    if len(ordered_indices) != len(dataset):
+        raise RuntimeError("Calibration index extraction produced the wrong length")
+
+    # Dataset access should not perturb any future stochastic work. The current
+    # calibration transforms are deterministic, but preserving RNG state keeps
+    # provenance collection behavior-neutral if a transform is later changed.
+    python_rng = random.getstate()
+    numpy_rng = np.random.get_state()
+    torch_rng = torch.random.get_rng_state()
+    try:
+        ordered_targets = _ordered_dataset_targets(
+            base_dataset, ordered_indices, dataset,
+        )
+        probe_records = []
+        for position in _calibration_probe_positions(
+                len(dataset), int(cal_loader.batch_size or 1)):
+            image, item_target = _split_dataset_item(dataset[position])
+            record = _tensor_hash_record(image)
+            record.update({
+                "ordinal": position,
+                "dataset_index": ordered_indices[position],
+                "target": (ordered_targets[position]
+                           if item_target is None else item_target),
+            })
+            probe_records.append(record)
+    finally:
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.random.set_rng_state(torch_rng)
+
+    return {
+        "requested_count": requested_n_cal,
+        "actual_count": len(ordered_indices),
+        "batch_size": int(cal_loader.batch_size or 1),
+        "num_workers": int(cal_loader.num_workers),
+        "drop_last": bool(cal_loader.drop_last),
+        "sampler": type(sampler).__name__,
+        "dataset_class": (
+            f"{type(base_dataset).__module__}.{type(base_dataset).__qualname__}"
+        ),
+        "base_dataset_length": len(base_dataset),
+        "transform": repr(getattr(base_dataset, "transform", None)),
+        "ordered_indices": ordered_indices,
+        "ordered_indices_sha256": _sha256_json(ordered_indices),
+        "ordered_targets": ordered_targets,
+        "ordered_targets_sha256": _sha256_json(ordered_targets),
+        "probe_tensors": probe_records,
+        "probe_tensors_sha256": _records_sha256(probe_records),
+    }
+
+
+def quantized_state_provenance(
+    model: nn.Module,
+    extra_quantized_names: Iterable[str] = (),
+) -> Dict[str, Any]:
+    quantized_names = []
+    buffer_names = []
+    runtime_flags = {}
+    for module_path, module in model.named_modules():
+        if not isinstance(module, QuantLinear):
+            continue
+        prefix = f"{module_path}." if module_path else ""
+        quantized_names.append(prefix + "weight")
+        runtime_flags[module_path] = {
+            "act_scale_set": bool(getattr(module, "_act_scale_set", False)),
+        }
+        for leaf in ("act_scale", "smooth_inv_scale"):
+            if torch.is_tensor(getattr(module, leaf, None)):
+                buffer_names.append(prefix + leaf)
+    quantized_names.extend(str(name) for name in extra_quantized_names)
+    quantized_names = sorted(set(quantized_names))
+    buffer_names = sorted(set(buffer_names))
+
+    state_dict = model.state_dict()
+    requested_names = set(quantized_names) | set(buffer_names)
+    missing = sorted(requested_names.difference(state_dict))
+    if missing:
+        raise RuntimeError(
+            f"Quantization provenance names missing from state_dict: {missing[:8]}"
+        )
+
+    all_records = {}
+    for name in sorted(state_dict):
+        value = state_dict[name]
+        if not torch.is_tensor(value):
+            continue
+        all_records[name] = {"name": name, **_tensor_hash_record(value)}
+
+    quantized_records = [all_records[name] for name in quantized_names]
+    buffer_records = [all_records[name] for name in buffer_names]
+    state_records = [all_records[name] for name in sorted(all_records)]
+    return {
+        "quantized_tensor_names": quantized_names,
+        "quantized_tensor_names_sha256": _sha256_json(quantized_names),
+        "quantized_tensors": quantized_records,
+        "quantized_tensors_sha256": _records_sha256(quantized_records),
+        "quantization_buffers": buffer_records,
+        "quantization_buffers_sha256": _records_sha256(buffer_records),
+        "runtime_flags": runtime_flags,
+        "state_dict_tensor_count": len(state_records),
+        "state_dict_sha256": _records_sha256(state_records),
+    }
+
+
+def build_quantization_provenance(
+    model: nn.Module,
+    cal_loader,
+    qcfg: QuantConfig,
+    quant_method: str,
+    scope: str,
+    source_checkpoint: str,
+    requested_n_cal: Optional[int],
+    selector_description: str,
+    run_context: Optional[Dict[str, Any]] = None,
+    source_files: Optional[Dict[str, str]] = None,
+    extra_quantized_names: Iterable[str] = (),
+) -> Dict[str, Any]:
+    source_file_records = {}
+    for role, path in sorted((source_files or {}).items()):
+        source_file_records[role] = _file_record(path)
+    return {
+        "schema": QUANT_PROVENANCE_SCHEMA,
+        "hash_spec": TENSOR_HASH_SPEC,
+        "run": _json_safe(run_context or {}),
+        "execution": _json_safe(reproducibility_provenance(model)),
+        "source_checkpoint": _file_record(source_checkpoint),
+        "source_files": source_file_records,
+        "calibration": calibration_provenance(cal_loader, requested_n_cal),
+        "quantization": {
+            "method": quant_method,
+            "scope": scope,
+            "selector": selector_description,
+            "config": _json_safe(qcfg.__dict__),
+            **quantized_state_provenance(model, extra_quantized_names),
+        },
+    }
+
+
+def _provenance_path(checkpoint_path: str, arm:str) -> str:
+    stem, _ = os.path.splitext(checkpoint_path)
+    return stem + arm + ".provenance.json"
+
+
+def save_quantized_checkpoint(
+    payload: Dict[str, Any],
+    checkpoint_path: str,
+    provenance: Dict[str, Any],
+    arm: str,
+) -> Tuple[str, Dict[str, Any]]:
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    manifest_path = _provenance_path(checkpoint_path, arm)
+
+    embedded = dict(provenance)
+    embedded["manifest_file"] = os.path.basename(manifest_path)
+    checkpoint_payload = dict(payload)
+    checkpoint_payload["provenance"] = embedded
+    torch.save(checkpoint_payload, checkpoint_path)
+
+    checkpoint_record = _file_record(checkpoint_path)
+    manifest = dict(embedded)
+    manifest["checkpoint"] = checkpoint_record
+    with open(manifest_path, "w") as handle:
+        json.dump(_json_safe(manifest), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    cal = manifest["calibration"]
+    quant = manifest["quantization"]
+    print(f"[Provenance] calibration_order={cal['ordered_indices_sha256']}")
+    print(f"[Provenance] calibration_probes={cal['probe_tensors_sha256']}")
+    print(f"[Provenance] quantized_names={quant['quantized_tensor_names_sha256']}")
+    print(f"[Provenance] quantized_tensors={quant['quantized_tensors_sha256']}")
+    print(f"[Provenance] state_dict={quant['state_dict_sha256']}")
+    print(f"[Provenance] checkpoint={checkpoint_record['sha256']}")
+    print(f"[Provenance] manifest={manifest_path}")
+    return manifest_path, checkpoint_record
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1037,7 +1463,7 @@ def _apply_args_file(args):
         "quant_method", "format", "smoothquant", "sq_alpha", "group_size",
         "n_cal", "cal_batch_size", "test_batch_size", "output_dir", "scope",
         "skip", "act_scheme", "args_file", "test_only", "model_family",
-        "strict_load", "download", "data_root", "prec",
+        "strict_load", "download", "data_root", "prec", "deterministic",
     }
     for key, value in values.items():
         if key not in skip and hasattr(args, key):
@@ -1475,6 +1901,7 @@ def apply_direct_parameter_rtn(
         quantized.append(name)
     if quantized:
         print(f"[RTN] Direct F.linear/matmul params quantized: {len(quantized)}")
+    return quantized
 
 
 def _register_missing_buffers(model: nn.Module, state_dict: dict):
@@ -1725,7 +2152,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # CLIP/PEFT checkpoint-shape options. These are filled from --args_file
     # when provided.
-    parser.add_argument("--prec", type=str, default="fp16", choices=["fp16", "fp32", "amp"])
+    parser.add_argument(
+        "--prec", type=str, default="fp32", choices=["fp16", "fp32", "amp"],
+        help="Model build precision. Deterministic FP32 is the canonical PTQ default.",
+    )
+    parser.add_argument(
+        "--deterministic", action=argparse.BooleanOptionalAction, default=True,
+        help="Use the canonical deterministic CUDA/FP32 runtime "
+             "(default: enabled; use --no-deterministic to opt out).",
+    )
     parser.add_argument("--resolution", type=int, default=224)
     parser.add_argument("--full_tuning", action="store_true")
     parser.add_argument("--bias_tuning", action="store_true")
@@ -1848,18 +2283,8 @@ def main():
     print("Output directory: {}".format(run_output_dir))
     os.makedirs(run_output_dir, exist_ok=True)
 
-    # ── Seed / determinism (from main_cp.py) ─────────────────────────────
-    if args.seed is not None:
-        seed = args.seed
-        print("Setting fixed seed: {}".format(seed))
-        random.seed(seed)
-        np.random.seed(seed)
-        os.environ['PYTHONHASHSEED'] = str(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = True
+    # ── Seed / deterministic FP32 runtime ────────────────────────────────
+    configure_reproducibility(args.seed, args.deterministic)
 
     # ── Build model and data via native Focal-SAM pipeline ────────────────
     bundle = build_focal_sam_data(args, family, device)
@@ -1946,9 +2371,10 @@ def main():
     if args.smoothquant:
         smoothquant_migrate(model, cal_loader, device, alpha=args.sq_alpha, model_args=model_args)
 
+    direct_quantized_names = []
     if args.quant_method == "rtn":
         apply_rtn(model, qcfg)
-        apply_direct_parameter_rtn(
+        direct_quantized_names = apply_direct_parameter_rtn(
             model, qcfg,
             selector=selector,
         )
@@ -2030,8 +2456,45 @@ def main():
               f"Δ vs baseline = {acc_q - overall_baseline:+.4f})")
 
     # ── Save ─────────────────────────────────────────────────────────────
+    arm = "_arm_"
+    if args.scope == "trainable":
+        arm += "a"
+    elif args.scope == "backbone_only":
+        arm += "b"
+    elif args.scope == "full":
+        arm += "c"
+    else:
+        print(f"invalid scope for 3-way-quant: {args.scope}")
     out_path = os.path.join(run_output_dir, f"model_{args.quant_method}_{args.format}.pth")
-    torch.save(
+    provenance = build_quantization_provenance(
+        model=model,
+        cal_loader=cal_loader,
+        qcfg=qcfg,
+        quant_method=args.quant_method,
+        scope=args.scope,
+        source_checkpoint=args.model_dir,
+        requested_n_cal=args.n_cal,
+        selector_description=selector.describe(),
+        run_context={
+            "argv": sys.argv,
+            "model_family": family,
+            "dataset": args.dataset,
+            "arch": args.arch,
+            "seed": args.seed,
+            "deterministic": bool(args.deterministic),
+            "effective_model_precision": args.prec,
+            "rand_number": args.rand_number,
+            "cal_batch_size": args.cal_batch_size,
+            "effective_act_scheme": act_scheme,
+            "adapter_key": args.adapter_key,
+            "classifier_key": args.classifier_key,
+            "quantize_text_encoder": args.quantize_text_encoder,
+            "skip": args.skip or [],
+        },
+        source_files={"entrypoint_and_quantizer": __file__},
+        extra_quantized_names=direct_quantized_names,
+    )
+    manifest_path, checkpoint_record = save_quantized_checkpoint(
         {
             "model": model.state_dict(),
             "qcfg": qcfg.__dict__,
@@ -2040,6 +2503,8 @@ def main():
             "acc": acc_q,
         },
         out_path,
+        provenance,
+        arm,
     )
     print(f"\nSaved to {out_path}")
 
@@ -2050,6 +2515,11 @@ def main():
         },
         "overall": {"fp32": float(acc_fp32), "quant": float(acc_q),
                     "delta": float(acc_q - acc_fp32)},
+        "artifacts": {
+            "quantized_checkpoint": checkpoint_record["path"],
+            "quantized_checkpoint_sha256": checkpoint_record["sha256"],
+            "provenance_manifest": manifest_path,
+        },
         "per_group": {},
         "per_class_fp32": pc_fp32.tolist(),
         "per_class_quant": pc_q.tolist(),
